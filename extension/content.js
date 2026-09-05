@@ -3,6 +3,29 @@
 (function() {
   'use strict';
 
+  const lifecycleKey = '__llmFeederContentScriptLifecycle';
+  const previousLifecycle = globalThis[lifecycleKey];
+  if (previousLifecycle && typeof previousLifecycle.dispose === 'function') {
+    previousLifecycle.dispose();
+  }
+
+  const cleanupCallbacks = [];
+  const contentLifecycle = {
+    addCleanup(callback) {
+      cleanupCallbacks.push(callback);
+    },
+    dispose() {
+      while (cleanupCallbacks.length) {
+        try {
+          cleanupCallbacks.pop()();
+        } catch (error) {
+          // An extension update can invalidate the previous runtime object.
+        }
+      }
+    }
+  };
+  globalThis[lifecycleKey] = contentLifecycle;
+
   // ==========================================================================
   // CONSTANTS
   // ==========================================================================
@@ -102,7 +125,7 @@
   // MESSAGE HANDLERS
   // ==========================================================================
 
-  browserRuntime.onMessage.addListener((request, sender, sendResponse) => {
+  const handleRuntimeMessage = (request, sender, sendResponse) => {
     // Ping handler
     if (request.action === 'ping') {
       sendResponse({ success: true });
@@ -207,12 +230,7 @@
     // Download file from data URL (used for ZIP downloads)
     if (request.action === 'downloadFile') {
       try {
-        const a = document.createElement('a');
-        a.href = request.dataUrl;
-        a.download = request.filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        downloadDataUrlFile(request.dataUrl, request.filename);
         sendResponse({ success: true });
       } catch (error) {
         console.error('Download file error:', error);
@@ -220,11 +238,182 @@
       }
       return true;
     }
+  };
+  browserRuntime.onMessage.addListener(handleRuntimeMessage);
+  contentLifecycle.addCleanup(() => {
+    if (browserRuntime.onMessage.removeListener) {
+      browserRuntime.onMessage.removeListener(handleRuntimeMessage);
+    }
   });
+
+  // ==========================================================================
+  // KEYBOARD SHORTCUT FALLBACK
+  // ==========================================================================
+
+  let assignedShortcutBindings = [];
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform || '');
+
+  function sendRuntimeMessage(message) {
+    if (typeof browser !== 'undefined' && browser.runtime === browserRuntime) {
+      return Promise.resolve(browserRuntime.sendMessage(message));
+    }
+
+    return new Promise((resolve, reject) => {
+      browserRuntime.sendMessage(message, response => {
+        const lastError = typeof chrome !== 'undefined' && chrome.runtime
+          ? chrome.runtime.lastError
+          : null;
+        if (lastError) reject(new Error(lastError.message));
+        else resolve(response);
+      });
+    });
+  }
+
+  async function refreshShortcutBindings() {
+    try {
+      const response = await sendRuntimeMessage({ action: 'getAssignedKeyboardShortcuts' });
+      assignedShortcutBindings = response && response.success && Array.isArray(response.bindings)
+        ? response.bindings
+        : [];
+    } catch (error) {
+      assignedShortcutBindings = [];
+    }
+  }
+
+  function getAcceptedShortcutResult(resultPromise) {
+    return resultPromise.then(result => {
+      if (!result || !result.accepted) {
+        const error = new Error((result && result.error) || 'Native shortcut handled');
+        error.shortcutIgnored = true;
+        throw error;
+      }
+      if (!result.success) {
+        throw new Error(result.error || 'Could not run keyboard shortcut');
+      }
+      return result;
+    });
+  }
+
+  function showShortcutNotification(result) {
+    if (result.notification) {
+      showNotification(result.notification.title, result.notification.message);
+    }
+  }
+
+  function reportShortcutError(error) {
+    if (error && error.shortcutIgnored) return;
+    console.error('Shortcut error:', error);
+    showNotification('Shortcut Failed', (error && error.message) || 'Could not run keyboard shortcut');
+  }
+
+  function finishShortcutInPage(result) {
+    if (result.action === 'copy') {
+      return copyTextToClipboard(result.text).then(() => showShortcutNotification(result));
+    }
+    if (result.action === 'downloadMarkdown') {
+      downloadMarkdownFile(result.markdown, result.title);
+      showShortcutNotification(result);
+      return Promise.resolve();
+    }
+    if (result.action === 'downloadFile') {
+      downloadDataUrlFile(result.dataUrl, result.filename);
+      showShortcutNotification(result);
+      return Promise.resolve();
+    }
+    return Promise.resolve();
+  }
+
+  // WebKit requires clipboard.write() during the physical key event. The
+  // payload stays pending while the background gives the native command a
+  // 500 ms head start and performs the normal single/multi-tab routing.
+  function handleShortcutFallback(binding) {
+    const resultPromise = getAcceptedShortcutResult(sendRuntimeMessage({
+      action: 'keyboardShortcutFallback',
+      command: binding.command,
+      shortcut: binding.shortcut
+    }));
+
+    const mayCopy = binding.command === 'convert_to_markdown' ||
+      binding.command === 'download_zip';
+    if (mayCopy && navigator.clipboard &&
+        navigator.clipboard.write && typeof ClipboardItem !== 'undefined') {
+      const copyPromise = navigator.clipboard.write([
+        new ClipboardItem({
+          'text/plain': resultPromise.then(result => {
+            if (result.action !== 'copy') {
+              throw new Error('Shortcut did not return clipboard text');
+            }
+            return new Blob([result.text], { type: 'text/plain' });
+          })
+        })
+      ]);
+
+      Promise.allSettled([resultPromise, copyPromise])
+        .then(([resultState, copyState]) => {
+          if (resultState.status === 'rejected') {
+            reportShortcutError(resultState.reason);
+            return;
+          }
+
+          const result = resultState.value;
+          if (result.action !== 'copy') {
+            finishShortcutInPage(result).catch(reportShortcutError);
+            return;
+          }
+          if (copyState.status === 'rejected') {
+            reportShortcutError(copyState.reason);
+            return;
+          }
+          showShortcutNotification(result);
+        });
+      return;
+    }
+
+    resultPromise
+      .then(finishShortcutInPage)
+      .catch(reportShortcutError);
+  }
+
+  const handleShortcutKeydown = event => {
+    const binding = ShortcutUtils.findMatchingShortcut(
+      assignedShortcutBindings,
+      event,
+      isMac
+    );
+    if (!binding) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    handleShortcutFallback(binding);
+  };
+  const handleShortcutFocus = () => refreshShortcutBindings();
+  const handleShortcutBlur = () => {
+    assignedShortcutBindings = [];
+  };
+
+  window.addEventListener('keydown', handleShortcutKeydown, true);
+  window.addEventListener('focus', handleShortcutFocus);
+  window.addEventListener('blur', handleShortcutBlur);
+  contentLifecycle.addCleanup(() => {
+    window.removeEventListener('keydown', handleShortcutKeydown, true);
+    window.removeEventListener('focus', handleShortcutFocus);
+    window.removeEventListener('blur', handleShortcutBlur);
+  });
+  refreshShortcutBindings();
 
   // ==========================================================================
   // UTILITY FUNCTIONS
   // ==========================================================================
+
+  function downloadDataUrlFile(dataUrl, filename) {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
 
   function downloadMarkdownFile(markdown, title) {
     const MAX_FILENAME_LENGTH = 100;
